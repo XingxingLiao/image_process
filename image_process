@@ -1,0 +1,143 @@
+import cv2
+import requests
+import json
+import paho.mqtt.client as mqtt
+import re
+import math
+
+# API Parameters
+url = "https://api.ocr.space/parse/image"
+api_key = "K87912659088957"
+image_path = "/home/xingxin/Downloads/whatsapp_image_2025-03-20_at_11.55.55.jpeg"
+
+# MQTT Configuration
+mqtt_broker = "138.100.58.174"
+mqtt_port = 1883
+mqtt_topic = "test/message"
+
+def preprocess_image(image_path, crop_coords, processed_image_path):
+    # 保持不变，确保正确预处理图像
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        print("Failed to read the image, please check the path.")
+        return None
+
+    x, y, w, h = crop_coords
+    cropped_image = image[y:y+h, x:x+w]
+    denoised_image = cv2.fastNlMeansDenoising(cropped_image, None, 30, 7, 21)
+    _, binary_image = cv2.threshold(denoised_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cv2.imwrite(processed_image_path, binary_image)
+    return processed_image_path
+
+def send_to_ocr_api(processed_image_path, api_key):
+    # 保持不变，正确发送OCR请求
+    with open(processed_image_path, "rb") as image_file:
+        return requests.post(
+            url,
+            files={"file": image_file},
+            headers={"apikey": api_key},
+            data={'OCREngine': '2'}
+        )
+import math
+import re
+
+def extract_numbers(text, region_id):
+    """处理前两个区域的数字/文本提取"""
+    results = []
+    
+    # 提取所有数字（包含多行处理）
+    numbers = re.findall(r'\d+\.\d+|\d+', text)  # 匹配整数和浮动数字（小数）
+    
+    # 判断是否有数字
+    if numbers:
+        # 获取第一个数字
+        first_number = numbers[0]
+        
+        # 如果是小数，直接添加
+        if '.' in first_number:
+            results.append(f"Region {region_id} - {first_number}")
+        else:
+            # 不是小数，进行处理
+            num = int(first_number)
+            if region_id == 1:
+                # 区域1：取第一个数字，保留1位小数
+                processed = math.floor(num / 10) * 10 / 10.0
+                results.append(f"Region {region_id} - {processed:.1f}")
+            elif region_id == 2:
+                # 区域2：取第一个数字，保留2位小数
+                processed = math.floor(num / 100) * 100 / 100.0
+                results.append(f"Region {region_id} - {processed:.2f}")
+    else:
+        # 如果没有数字时提取首行的 OUT/OFF 状态
+        first_line = text.split("\n")[0].strip() if text else ""
+        
+        # 使用正则表达式匹配 OUT 或 OFF（全词匹配，不区分大小写）
+        status_match = re.search(r'\b(OUT|OFF)\b', first_line, re.IGNORECASE)
+        if status_match:
+            status = status_match.group(1).upper()
+            results.append(f"Region {region_id} - {status}")
+        else:
+            # 如果首行没有 OUT/OFF，返回原始首行或默认提示
+            fallback_text = first_line if first_line else "No Text"
+            results.append(f"Region {region_id} - {fallback_text}")
+    
+    return results
+
+
+def extract_on_off(text, region_id):
+    """处理第三个区域的ON/OFF状态"""
+    matches = re.findall(r'\b(ON|OFF)\b', text, flags=re.IGNORECASE)
+    return [f"Region {region_id} - {state.upper()} #{i+1}" for i, state in enumerate(matches)]
+
+def send_mqtt_message(message):
+    # 保持不变的MQTT发送
+    client = mqtt.Client()
+    client.connect(mqtt_broker, mqtt_port, 60)
+    client.publish(mqtt_topic, json.dumps(message))
+    client.disconnect()
+
+# 区域配置（前两个数字区，第三个ON/OFF区）
+crop_coordinates = [
+    # (445, 872, 200, 100),   # Region 1
+    # (686, 875, 248, 100),   # Region 2
+    # (483, 1084, 433, 501)   # Region 3 (ON/OFF)
+    (409, 624, 245, 112),   # Region 1
+    (781, 612, 209, 118),   # Region 2
+    (430, 895, 545, 631)   # Region 3 (ON/OFF)
+]
+
+all_results = []
+on_off_results = []
+
+for i, coords in enumerate(crop_coordinates):
+    region_id = i + 1
+    processed_path = f"/home/xingxin/processed_region_{region_id}.jpeg"
+    
+    if preprocess_image(image_path, coords, processed_path):
+        response = send_to_ocr_api(processed_path, api_key)
+        if response.status_code == 200:
+            result = response.json()
+            if not result.get("IsErroredOnProcessing"):
+                text = result["ParsedResults"][0]["ParsedText"]
+                print(f"Region {region_id} OCR Raw Text:\n{text}")  # 调试输出
+                
+                if region_id <= 2:
+                    # 处理前两个数字区域
+                    all_results.extend(extract_numbers(text, region_id))
+                else:
+                    # 处理第三个ON/OFF区域
+                    on_off_results.extend(extract_on_off(text, region_id))
+            else:
+                print(f"Region {region_id} OCR Error:", result.get("ErrorMessage"))
+        else:
+            print(f"Region {region_id} API Error:", response.status_code)
+
+# 构建最终消息
+message = {
+    "status": "success",
+    "Module_Numbers": all_results,
+    "Module_ON_Lines": on_off_results
+}
+
+send_mqtt_message(message)
+print("Final Message:", json.dumps(message, indent=2))
